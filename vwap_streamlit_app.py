@@ -101,10 +101,12 @@ SYMBOLS = [
     {"sym":"GBPUSD=X",     "name":"GBP/USD FOREX PAIR",              "type":"forex",   "cat":"Forex",    "exch":"FX",   "flag":"💱"},
     {"sym":"USDJPY=X",     "name":"USD/JPY FOREX PAIR",              "type":"forex",   "cat":"Forex",    "exch":"FX",   "flag":"💱"},
     # ── Futures ──
-    {"sym":"NIFTY1!",      "name":"S&P CNX NIFTY INDEX FUTURES",     "type":"futures", "cat":"Futures",  "exch":"NSE",  "flag":"🇮🇳"},
+    {"sym":"^NSEI",        "name":"NIFTY 50 INDEX (Nifty Futures Proxy)","type":"futures","cat":"Futures","exch":"NSE", "flag":"🇮🇳"},
     {"sym":"GC=F",         "name":"GOLD FUTURES",                    "type":"futures", "cat":"Futures",  "exch":"COMEX","flag":"🟡"},
     {"sym":"CL=F",         "name":"CRUDE OIL FUTURES (WTI)",         "type":"futures", "cat":"Futures",  "exch":"NYMEX","flag":"🛢️"},
     {"sym":"SI=F",         "name":"SILVER FUTURES",                  "type":"futures", "cat":"Futures",  "exch":"COMEX","flag":"⚪"},
+    {"sym":"ES=F",         "name":"E-MINI S&P 500 FUTURES",          "type":"futures", "cat":"Futures",  "exch":"CME",  "flag":"🇺🇸"},
+    {"sym":"NQ=F",         "name":"E-MINI NASDAQ 100 FUTURES",       "type":"futures", "cat":"Futures",  "exch":"CME",  "flag":"🇺🇸"},
     # ── ETFs / Funds ──
     {"sym":"GOLDBEES.NS",  "name":"NIPPON INDIA ETF GOLD BEES",      "type":"etf",     "cat":"Funds",    "exch":"NSE",  "flag":"🇮🇳"},
     {"sym":"NIFTYBEES.NS", "name":"NIPPON INDIA ETF NIFTY BEES",     "type":"etf",     "cat":"Funds",    "exch":"NSE",  "flag":"🇮🇳"},
@@ -114,6 +116,35 @@ SYMBOLS = [
 ]
 
 CATEGORIES = ["All","Stocks","Indices","Futures","Forex","Crypto","Funds"]
+
+# ─────────────────────────────────────────────────────────────
+#  TRADINGVIEW → YFINANCE SYMBOL MAPPING
+# ─────────────────────────────────────────────────────────────
+TV_TO_YF = {
+    "NIFTY1!":     "^NSEI",    "BANKNIFTY1!": "^NSEBANK",
+    "NIFTY":       "^NSEI",    "BANKNIFTY":   "^NSEBANK",
+    "SENSEX":      "^BSESN",   "SPX":         "^GSPC",
+    "NDX":         "^IXIC",    "DJX":         "^DJI",
+    "GOLD":        "GC=F",     "SILVER":      "SI=F",
+    "CRUDEOIL":    "CL=F",     "BITCOIN":     "BTC-USD",
+    "ETHEREUM":    "ETH-USD",  "CNXFINANCE":  "^CNXFINANCE",
+    "CNXAUTO":     "^CNXAUTO", "CNXPHARMA":   "^CNXPHARMA",
+    "CNXFMCG":     "^CNXFMCG", "CNXMETAL":    "^CNXMETAL",
+    "CNXREALTY":   "^CNXREALTY","CNXMIDCAP":  "^CNXMIDCAP",
+    "CNXSMALLCAP": "^CNXSMALLCAP","CNXIT":    "^CNXIT",
+}
+
+def resolve_ticker(raw: str) -> str:
+    """Convert TV-style or shorthand to valid yfinance ticker."""
+    t = raw.strip().upper()
+    return TV_TO_YF.get(t, t)
+
+# Period clamps per interval (yfinance limits)
+MAX_PERIOD = {
+    "1m":"7d","2m":"60d","5m":"60d","15m":"60d",
+    "30m":"60d","60m":"730d","1h":"730d","1d":"max",
+}
+
 
 TYPE_COLORS = {
     "stock":   ("#1a3a1f","#26a69a"),
@@ -339,7 +370,29 @@ def symbol_search_panel():
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_data(t, i, p):
-    df = yf.download(t, interval=i, period=p, auto_adjust=True)
+    yf_ticker = resolve_ticker(t)
+    # Clamp period to yfinance's limits for intraday intervals
+    intraday = ["1m","2m","5m","15m","30m","60m","90m","1h"]
+    if i in intraday:
+        limits = {"1m":"7d","2m":"60d","5m":"60d","15m":"60d",
+                  "30m":"60d","60m":"730d","90m":"60d","1h":"730d"}
+        max_p = limits.get(i, "60d")
+        # convert period strings to days for comparison
+        def to_days(s):
+            if s=="max": return 99999
+            if s.endswith("d"):  return int(s[:-1])
+            if s.endswith("mo"): return int(s[:-2])*30
+            if s.endswith("y"):  return int(s[:-1])*365
+            return 60
+        if to_days(p) > to_days(max_p):
+            p = max_p
+    df = yf.download(yf_ticker, interval=i, period=p, auto_adjust=True, progress=False)
+    if df.empty:
+        raise ValueError(
+            f"No data returned for '{t}'"
+            + (f" (mapped to '{yf_ticker}')" if yf_ticker != t else "")
+            + f". Check the ticker or try a different interval/period."
+        )
     df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
     return df.dropna()
 
@@ -716,12 +769,40 @@ ticker = st.session_state.get("last_run", ticker)
 # ─────────────────────────────────────────────────────────────
 with st.spinner(f"📥 Fetching {ticker} ({interval} · {period}) …"):
     try:
+        yf_sym = resolve_ticker(ticker)
         raw = fetch_data(ticker, interval, period)
         if raw.empty:
-            st.error(f"❌ No data for **{ticker}**. Try a different ticker or interval.")
+            st.error(f"❌ No data returned for **{ticker}**"
+                     + (f" (tried yfinance: `{yf_sym}`)" if yf_sym != ticker else "")
+                     + ". Try a different interval or period.")
             st.stop()
     except Exception as e:
-        st.error(f"❌ {e}")
+        yf_sym2 = resolve_ticker(ticker)
+        st.error(f"❌ **{ticker}** — {e}")
+        # Show helpful suggestions
+        st.markdown(f"""
+        <div style="background:#1e222d;border:1px solid #ef535055;border-radius:8px;padding:16px 20px;margin-top:8px">
+          <b style="color:#d1d4dc">💡 Troubleshooting Tips</b><br><br>
+          <div style="font-size:13px;color:#787b86;line-height:2">
+          {'<span style="color:#ff9800">⚠️ Ticker mapped to: <b style="color:#d1d4dc">' + yf_sym2 + '</b> — try selecting it directly from Symbol Search.</span><br>' if yf_sym2 != ticker else ''}
+          • For <b style="color:#d1d4dc">NSE stocks</b> — add <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">.NS</code>
+            e.g. <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">RELIANCE.NS</code><br>
+          • For <b style="color:#d1d4dc">BSE stocks</b> — add <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">.BO</code>
+            e.g. <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">RELIANCE.BO</code><br>
+          • For <b style="color:#d1d4dc">Nifty 50</b> — use
+            <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">^NSEI</code><br>
+          • For <b style="color:#d1d4dc">Bank Nifty</b> — use
+            <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">^NSEBANK</code><br>
+          • For <b style="color:#d1d4dc">Sensex</b> — use
+            <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">^BSESN</code><br>
+          • For <b style="color:#d1d4dc">Crypto</b> — use
+            <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">BTC-USD</code>,
+            <code style="color:#26a69a;background:#131722;padding:1px 5px;border-radius:3px">ETH-USD</code><br>
+          • <b style="color:#d1d4dc">Intraday data</b> (5m/15m/1h) is limited to last <b>60 days</b> by Yahoo Finance<br>
+          • Use the <b style="color:#2196f3">🔍 Search Symbol</b> button for verified tickers
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
         st.stop()
 
 with st.spinner("⚙️ Running backtest …"):
@@ -732,7 +813,8 @@ with st.spinner("⚙️ Running backtest …"):
 
 # ── ticker info bar ──
 try:
-    fi  = yf.Ticker(ticker).fast_info
+    yf_sym_info = resolve_ticker(ticker)
+    fi  = yf.Ticker(yf_sym_info).fast_info
     lp  = fi.last_price; pc2 = fi.previous_close
     chg = lp - pc2; pct = chg/pc2*100
     pc_ = "#26a69a" if chg>=0 else "#ef5350"
