@@ -371,102 +371,161 @@ def symbol_search_panel():
 @st.cache_data(ttl=300)
 def fetch_data(t, i, p):
     yf_ticker = resolve_ticker(t)
-    # Clamp period to yfinance's limits for intraday intervals
-    intraday = ["1m","2m","5m","15m","30m","60m","90m","1h"]
-    if i in intraday:
-        limits = {"1m":"7d","2m":"60d","5m":"60d","15m":"60d",
-                  "30m":"60d","60m":"730d","90m":"60d","1h":"730d"}
-        max_p = limits.get(i, "60d")
-        # convert period strings to days for comparison
-        def to_days(s):
-            if s=="max": return 99999
-            if s.endswith("d"):  return int(s[:-1])
-            if s.endswith("mo"): return int(s[:-2])*30
-            if s.endswith("y"):  return int(s[:-1])*365
-            return 60
-        if to_days(p) > to_days(max_p):
-            p = max_p
-    df = yf.download(yf_ticker, interval=i, period=p, auto_adjust=True, progress=False)
-    if df.empty:
+    # Clamp period for intraday intervals (yfinance hard limits)
+    def to_days(s):
+        if s == "max": return 99999
+        if s.endswith("d"):  return int(s[:-1])
+        if s.endswith("mo"): return int(s[:-2]) * 30
+        if s.endswith("y"):  return int(s[:-1]) * 365
+        return 60
+    limits = {"1m":"7d","2m":"60d","5m":"60d","15m":"60d",
+              "30m":"60d","60m":"730d","90m":"60d","1h":"730d"}
+    if i in limits and to_days(p) > to_days(limits[i]):
+        p = limits[i]
+
+    raw = yf.download(yf_ticker, interval=i, period=p,
+                      auto_adjust=True, progress=False, threads=False)
+    if raw is None or raw.empty:
         raise ValueError(
             f"No data returned for '{t}'"
-            + (f" (mapped to '{yf_ticker}')" if yf_ticker != t else "")
-            + f". Check the ticker or try a different interval/period."
+            + (f" (tried as '{yf_ticker}')" if yf_ticker != t else "")
+            + ". Check the ticker symbol or try a different interval/period."
         )
-    # Flatten MultiIndex columns (yfinance returns them with ticker suffix)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[0]).lower() for c in df.columns]
+
+    # ── Robust column flattening ──────────────────────────────
+    # yfinance v0.2+ returns MultiIndex: ("Close","RELIANCE.NS")
+    # We need flat lowercase single-level columns
+    if isinstance(raw.columns, pd.MultiIndex):
+        # take only the first level (price type), drop ticker level
+        raw.columns = [str(c[0]).strip().lower() for c in raw.columns]
     else:
-        df.columns = [str(c).lower() for c in df.columns]
-    # Keep only OHLCV
-    needed = [c for c in ["open","high","low","close","volume"] if c in df.columns]
-    if not needed:
-        raise ValueError(f"Could not find OHLCV columns for '{t}'. Got: {list(df.columns)}")
-    df = df[needed].copy()
-    df = df.dropna()
+        raw.columns = [str(c).strip().lower() for c in raw.columns]
+
+    # Drop duplicate columns that can appear after flattening
+    raw = raw.loc[:, ~raw.columns.duplicated()]
+
+    # Force every column to a plain 1-D float Series
+    # (sometimes yfinance nests a DataFrame inside a column)
+    clean_cols = {}
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in raw.columns:
+            continue
+        s = raw[col]
+        # If it came back as a DataFrame, take the first column
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        clean_cols[col] = pd.to_numeric(s, errors="coerce")
+
+    if "close" not in clean_cols:
+        raise ValueError(
+            f"Cannot find 'close' column for '{t}'. "
+            f"Available columns: {list(raw.columns)}"
+        )
+
+    df = pd.DataFrame(clean_cols, index=raw.index)
+    df = df.dropna(subset=["open","high","low","close"])
+    df = df.sort_index()
+
     if df.empty:
         raise ValueError(
-            f"Data for '{t}' returned all NaN after cleaning. "
-            "Try a longer period or different interval."
+            f"Data for '{t}' is empty after cleaning NaN rows. "
+            "Try a longer period or a different interval."
         )
     return df
 
 def calc_indicators(df, ma_len, atr_len):
-    if df.empty or len(df) < max(ma_len, atr_len) + 5:
-        raise ValueError(
-            f"Not enough data ({len(df)} bars) to compute indicators. "
-            f"Need at least {max(ma_len, atr_len)+5} bars. "
-            "Try a longer period or reduce MA/ATR length."
-        )
     df = df.copy()
-    # Ensure all columns are numeric
+
+    # ── Ensure all OHLCV are plain 1-D float Series ───────────
     for col in ["open","high","low","close","volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if isinstance(s, pd.DataFrame):   # nested DataFrame → take 1st col
+            s = s.iloc[:, 0]
+        df[col] = pd.to_numeric(s, errors="coerce")
+
+    # Drop rows where price data is missing
     df = df.dropna(subset=["open","high","low","close"])
-    df["tp"]   = (df["high"]+df["low"]+df["close"])/3
-    df["vwap"] = (df["tp"]*df["volume"]).cumsum() / df["volume"].cumsum()
-    df["ma"]   = df["close"].rolling(ma_len).mean()
-    pc = df["close"].shift(1)
-    df["tr"]   = np.maximum(df["high"]-df["low"],
-                 np.maximum(abs(df["high"]-pc), abs(df["low"]-pc)))
-    df["atr"]  = df["tr"].rolling(atr_len).mean()
-    df = df.dropna()
+    df = df.sort_index()
+
+    n_bars = len(df)
+    min_bars = max(ma_len, atr_len) + 2
+    if n_bars < min_bars:
+        raise ValueError(
+            f"Only {n_bars} valid bars after cleaning — need at least {min_bars}. "
+            f"Try a longer period (e.g. 3mo or 6mo) or "
+            f"reduce SMA/ATR length below {n_bars - 2}."
+        )
+
+    # ── VWAP ──────────────────────────────────────────────────
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    vol = df["volume"].fillna(0).replace(0, np.nan)   # avoid div-by-zero
+    df["vwap"] = (tp * vol).cumsum() / vol.cumsum()
+
+    # ── SMA ───────────────────────────────────────────────────
+    df["ma"] = df["close"].rolling(window=ma_len, min_periods=ma_len).mean()
+
+    # ── ATR ───────────────────────────────────────────────────
+    pc        = df["close"].shift(1)
+    hl        = df["high"] - df["low"]
+    hc        = (df["high"] - pc).abs()
+    lc        = (df["low"]  - pc).abs()
+    df["tr"]  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df["atr"] = df["tr"].rolling(window=atr_len, min_periods=atr_len).mean()
+
+    # Drop only rows where MA or ATR is NaN (first ma_len/atr_len rows)
+    df = df.dropna(subset=["ma","atr","vwap"])
+
     if df.empty:
         raise ValueError(
-            "DataFrame is empty after indicator calculation. "
-            "Try a longer period or reduce the MA/ATR length values."
+            f"Zero rows remain after indicator warmup period. "
+            f"Your period has {n_bars} bars but SMA={ma_len}, ATR={atr_len} "
+            f"need {min_bars}+ bars. Use a longer period or smaller indicator lengths."
         )
     return df
 
 def gen_signals(df, mult):
     df = df.copy()
-    df["buy_sig"]   = (df["close"] < df["vwap"]) & (df["close"] > df["ma"])
-    df["sell_sig"]  = (df["close"] > df["vwap"]) & (df["close"] < df["ma"])
-    df["buy_stop"]  = df["close"] - mult * df["atr"]
-    df["sell_stop"] = df["close"] + mult * df["atr"]
+    close = df["close"].squeeze()
+    vwap  = df["vwap"].squeeze()
+    ma    = df["ma"].squeeze()
+    atr   = df["atr"].squeeze()
+    df["buy_sig"]   = (close < vwap) & (close > ma)
+    df["sell_sig"]  = (close > vwap) & (close < ma)
+    df["buy_stop"]  = close - mult * atr
+    df["sell_stop"] = close + mult * atr
     return df
+
+def safe_float(val):
+    """Safely extract a Python float from any pandas scalar/Series/DataFrame."""
+    if isinstance(val, (pd.Series, pd.DataFrame)):
+        val = val.iloc[0]
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
 
 def backtest(df, cap):
     if df is None or df.empty:
         raise ValueError("Cannot run backtest: DataFrame is empty.")
     if len(df) < 2:
         raise ValueError(f"Cannot run backtest: only {len(df)} row(s). Need at least 2.")
-    # Squeeze any leftover multi-level columns into flat Series
+    # Flatten all columns to plain Series
     for col in list(df.columns):
-        if hasattr(df[col], "squeeze"):
-            try:
-                df[col] = df[col].squeeze()
-            except Exception:
-                pass
+        s = df[col]
+        if isinstance(s, pd.DataFrame):
+            df[col] = s.iloc[:, 0]
     capital = float(cap)
     pos = entry_px = stop_px = 0.0
     entry_time = entry_bar = None
     trades, equity = [], []
-    bah0 = float(df["close"].iloc[0])
+    bah0 = safe_float(df["close"].iloc[0])
+    if bah0 == 0.0:
+        raise ValueError("First close price is zero or invalid — cannot run backtest.")
     for i, (_, row) in enumerate(df.iterrows()):
         bar = i + 1
-        if pos == 1 and float(row["low"]) <= stop_px:
+        if pos == 1 and safe_float(row["low"]) <= stop_px:
             pnl = stop_px - entry_px; capital += pnl
             trades.append(dict(num=len(trades)+1, type="Buy",
                 entry_time=entry_time, exit_time=row.name,
@@ -476,7 +535,7 @@ def backtest(df, cap):
                 pnl_pct=round(pnl/entry_px*100,3),
                 result="Win" if pnl>0 else "Loss"))
             pos = 0
-        elif pos == -1 and float(row["high"]) >= stop_px:
+        elif pos == -1 and safe_float(row["high"]) >= stop_px:
             pnl = entry_px - stop_px; capital += pnl
             trades.append(dict(num=len(trades)+1, type="Sell",
                 entry_time=entry_time, exit_time=row.name,
@@ -488,15 +547,15 @@ def backtest(df, cap):
             pos = 0
         if pos == 0:
             if row["buy_sig"]:
-                pos=1; entry_px=float(row["close"]); stop_px=float(row["buy_stop"])
+                pos=1; entry_px=safe_float(row["close"]); stop_px=safe_float(row["buy_stop"])
                 entry_time=row.name; entry_bar=bar
             elif row["sell_sig"]:
-                pos=-1; entry_px=float(row["close"]); stop_px=float(row["sell_stop"])
+                pos=-1; entry_px=safe_float(row["close"]); stop_px=safe_float(row["sell_stop"])
                 entry_time=row.name; entry_bar=bar
         equity.append(capital)
     df = df.copy()
     df["equity"] = equity[:len(df)]
-    df["bah"]    = [cap * float(df["close"].iloc[i]) / bah0 for i in range(len(df))]
+    df["bah"]    = [cap * safe_float(df["close"].iloc[i]) / bah0 for i in range(len(df))]
     df["dd"]     = df["equity"] - df["equity"].cummax()
     df["dd_pct"] = df["dd"] / df["equity"].cummax() * 100
     return df, pd.DataFrame(trades), capital
