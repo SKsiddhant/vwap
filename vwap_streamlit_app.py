@@ -393,11 +393,37 @@ def fetch_data(t, i, p):
             + (f" (mapped to '{yf_ticker}')" if yf_ticker != t else "")
             + f". Check the ticker or try a different interval/period."
         )
-    df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
-    return df.dropna()
+    # Flatten MultiIndex columns (yfinance returns them with ticker suffix)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(c[0]).lower() for c in df.columns]
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
+    # Keep only OHLCV
+    needed = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+    if not needed:
+        raise ValueError(f"Could not find OHLCV columns for '{t}'. Got: {list(df.columns)}")
+    df = df[needed].copy()
+    df = df.dropna()
+    if df.empty:
+        raise ValueError(
+            f"Data for '{t}' returned all NaN after cleaning. "
+            "Try a longer period or different interval."
+        )
+    return df
 
 def calc_indicators(df, ma_len, atr_len):
+    if df.empty or len(df) < max(ma_len, atr_len) + 5:
+        raise ValueError(
+            f"Not enough data ({len(df)} bars) to compute indicators. "
+            f"Need at least {max(ma_len, atr_len)+5} bars. "
+            "Try a longer period or reduce MA/ATR length."
+        )
     df = df.copy()
+    # Ensure all columns are numeric
+    for col in ["open","high","low","close","volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["open","high","low","close"])
     df["tp"]   = (df["high"]+df["low"]+df["close"])/3
     df["vwap"] = (df["tp"]*df["volume"]).cumsum() / df["volume"].cumsum()
     df["ma"]   = df["close"].rolling(ma_len).mean()
@@ -405,7 +431,13 @@ def calc_indicators(df, ma_len, atr_len):
     df["tr"]   = np.maximum(df["high"]-df["low"],
                  np.maximum(abs(df["high"]-pc), abs(df["low"]-pc)))
     df["atr"]  = df["tr"].rolling(atr_len).mean()
-    return df.dropna()
+    df = df.dropna()
+    if df.empty:
+        raise ValueError(
+            "DataFrame is empty after indicator calculation. "
+            "Try a longer period or reduce the MA/ATR length values."
+        )
+    return df
 
 def gen_signals(df, mult):
     df = df.copy()
@@ -416,6 +448,17 @@ def gen_signals(df, mult):
     return df
 
 def backtest(df, cap):
+    if df is None or df.empty:
+        raise ValueError("Cannot run backtest: DataFrame is empty.")
+    if len(df) < 2:
+        raise ValueError(f"Cannot run backtest: only {len(df)} row(s). Need at least 2.")
+    # Squeeze any leftover multi-level columns into flat Series
+    for col in list(df.columns):
+        if hasattr(df[col], "squeeze"):
+            try:
+                df[col] = df[col].squeeze()
+            except Exception:
+                pass
     capital = float(cap)
     pos = entry_px = stop_px = 0.0
     entry_time = entry_bar = None
@@ -806,10 +849,25 @@ with st.spinner(f"📥 Fetching {ticker} ({interval} · {period}) …"):
         st.stop()
 
 with st.spinner("⚙️ Running backtest …"):
-    df   = calc_indicators(raw, ma_length, atr_length)
-    df   = gen_signals(df, atr_mult)
-    df, tdf, final_cap = backtest(df, starting_cap)
-    s    = compute_stats(tdf, starting_cap, final_cap, df)
+    try:
+        df   = calc_indicators(raw, ma_length, atr_length)
+        df   = gen_signals(df, atr_mult)
+        df, tdf, final_cap = backtest(df, starting_cap)
+        s    = compute_stats(tdf, starting_cap, final_cap, df)
+    except (ValueError, IndexError, KeyError) as e:
+        st.error(f"❌ Backtest error: {e}")
+        st.markdown("""
+        <div style="background:#1e222d;border:1px solid #ef535055;border-radius:8px;
+          padding:14px 18px;margin-top:8px;font-size:13px;color:#787b86;line-height:2">
+        <b style="color:#d1d4dc">💡 Try these fixes:</b><br>
+        • Reduce <b style="color:#ff9800">SMA / ATR Length</b> (currently might be larger than available bars)<br>
+        • Use a <b style="color:#ff9800">longer Period</b> (e.g. <code>3mo</code> or <code>6mo</code>)<br>
+        • Switch to <b style="color:#ff9800">1d interval</b> for more historical data<br>
+        • Some tickers have limited data on Yahoo Finance — try a major index like
+          <code style="color:#26a69a">^NSEI</code> or <code style="color:#26a69a">RELIANCE.NS</code>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
 
 # ── ticker info bar ──
 try:
