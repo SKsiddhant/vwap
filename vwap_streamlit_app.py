@@ -459,9 +459,22 @@ def calc_indicators(df, ma_len, atr_len):
         )
 
     # ── VWAP ──────────────────────────────────────────────────
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    vol = df["volume"].fillna(0).replace(0, np.nan)   # avoid div-by-zero
-    df["vwap"] = (tp * vol).cumsum() / vol.cumsum()
+    tp  = (df["high"] + df["low"] + df["close"]) / 3
+    vol = df["volume"].fillna(0)
+
+    # Detect if this is an index / instrument with no real volume
+    has_volume = (vol > 0).sum() > len(vol) * 0.1   # >10% of bars have volume
+
+    if has_volume:
+        # Normal VWAP — cumulative volume-weighted price
+        safe_vol   = vol.replace(0, np.nan)
+        df["vwap"] = (tp * safe_vol).cumsum() / safe_vol.cumsum()
+        # Forward-fill any gaps where vol was 0 mid-session
+        df["vwap"] = df["vwap"].ffill().bfill()
+    else:
+        # No volume data (index like ^NSEI, ^BSESN, ^NSEBANK, ^GSPC …)
+        # Use a rolling VWAP equivalent: SMA of typical price
+        df["vwap"] = tp.rolling(window=ma_len, min_periods=1).mean()
 
     # ── SMA ───────────────────────────────────────────────────
     df["ma"] = df["close"].rolling(window=ma_len, min_periods=ma_len).mean()
@@ -474,14 +487,16 @@ def calc_indicators(df, ma_len, atr_len):
     df["tr"]  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = df["tr"].rolling(window=atr_len, min_periods=atr_len).mean()
 
-    # Drop only rows where MA or ATR is NaN (first ma_len/atr_len rows)
-    df = df.dropna(subset=["ma","atr","vwap"])
+    # Drop only warmup rows (where MA or ATR not yet ready)
+    df = df.dropna(subset=["ma", "atr"])
+    # VWAP should now always be valid — fill any remaining gaps just in case
+    df["vwap"] = df["vwap"].ffill().bfill()
 
     if df.empty:
         raise ValueError(
-            f"Zero rows remain after indicator warmup period. "
-            f"Your period has {n_bars} bars but SMA={ma_len}, ATR={atr_len} "
-            f"need {min_bars}+ bars. Use a longer period or smaller indicator lengths."
+            f"Zero rows remain after indicator warmup. "
+            f"Period has {n_bars} bars — SMA={ma_len}, ATR={atr_len} "
+            f"need {min_bars}+ bars. Use a longer period or reduce lengths."
         )
     return df
 
