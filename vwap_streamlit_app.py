@@ -12,8 +12,14 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import html
 import warnings
 warnings.filterwarnings("ignore")
+
+from vwap_engine import (
+    backtest, calc_indicators, clean_ticker, compute_stats, gen_signals,
+    is_intraday, resolve_ticker,
+)
 
 st.set_page_config(page_title="SpringPad VWAP Strategy",
                    page_icon="📈", layout="wide",
@@ -120,25 +126,6 @@ CATEGORIES = ["All","Stocks","Indices","Futures","Forex","Crypto","Funds"]
 # ─────────────────────────────────────────────────────────────
 #  TRADINGVIEW → YFINANCE SYMBOL MAPPING
 # ─────────────────────────────────────────────────────────────
-TV_TO_YF = {
-    "NIFTY1!":     "^NSEI",    "BANKNIFTY1!": "^NSEBANK",
-    "NIFTY":       "^NSEI",    "BANKNIFTY":   "^NSEBANK",
-    "SENSEX":      "^BSESN",   "SPX":         "^GSPC",
-    "NDX":         "^IXIC",    "DJX":         "^DJI",
-    "GOLD":        "GC=F",     "SILVER":      "SI=F",
-    "CRUDEOIL":    "CL=F",     "BITCOIN":     "BTC-USD",
-    "ETHEREUM":    "ETH-USD",  "CNXFINANCE":  "^CNXFINANCE",
-    "CNXAUTO":     "^CNXAUTO", "CNXPHARMA":   "^CNXPHARMA",
-    "CNXFMCG":     "^CNXFMCG", "CNXMETAL":    "^CNXMETAL",
-    "CNXREALTY":   "^CNXREALTY","CNXMIDCAP":  "^CNXMIDCAP",
-    "CNXSMALLCAP": "^CNXSMALLCAP","CNXIT":    "^CNXIT",
-}
-
-def resolve_ticker(raw: str) -> str:
-    """Convert TV-style or shorthand to valid yfinance ticker."""
-    t = raw.strip().upper()
-    return TV_TO_YF.get(t, t)
-
 # Period clamps per interval (yfinance limits)
 MAX_PERIOD = {
     "1m":"7d","2m":"60d","5m":"60d","15m":"60d",
@@ -433,186 +420,6 @@ def fetch_data(t, i, p):
         )
     return df
 
-def calc_indicators(df, ma_len, atr_len):
-    df = df.copy()
-
-    # ── Ensure all OHLCV are plain 1-D float Series ───────────
-    for col in ["open","high","low","close","volume"]:
-        if col not in df.columns:
-            continue
-        s = df[col]
-        if isinstance(s, pd.DataFrame):   # nested DataFrame → take 1st col
-            s = s.iloc[:, 0]
-        df[col] = pd.to_numeric(s, errors="coerce")
-
-    # Drop rows where price data is missing
-    df = df.dropna(subset=["open","high","low","close"])
-    df = df.sort_index()
-
-    n_bars = len(df)
-    min_bars = max(ma_len, atr_len) + 2
-    if n_bars < min_bars:
-        raise ValueError(
-            f"Only {n_bars} valid bars after cleaning — need at least {min_bars}. "
-            f"Try a longer period (e.g. 3mo or 6mo) or "
-            f"reduce SMA/ATR length below {n_bars - 2}."
-        )
-
-    # ── VWAP ──────────────────────────────────────────────────
-    tp  = (df["high"] + df["low"] + df["close"]) / 3
-    vol = df["volume"].fillna(0)
-
-    # Detect if this is an index / instrument with no real volume
-    has_volume = (vol > 0).sum() > len(vol) * 0.1   # >10% of bars have volume
-
-    if has_volume:
-        # Normal VWAP — cumulative volume-weighted price
-        safe_vol   = vol.replace(0, np.nan)
-        df["vwap"] = (tp * safe_vol).cumsum() / safe_vol.cumsum()
-        # Forward-fill any gaps where vol was 0 mid-session
-        df["vwap"] = df["vwap"].ffill().bfill()
-    else:
-        # No volume data (index like ^NSEI, ^BSESN, ^NSEBANK, ^GSPC …)
-        # Use a rolling VWAP equivalent: SMA of typical price
-        df["vwap"] = tp.rolling(window=ma_len, min_periods=1).mean()
-
-    # ── SMA ───────────────────────────────────────────────────
-    df["ma"] = df["close"].rolling(window=ma_len, min_periods=ma_len).mean()
-
-    # ── ATR ───────────────────────────────────────────────────
-    pc        = df["close"].shift(1)
-    hl        = df["high"] - df["low"]
-    hc        = (df["high"] - pc).abs()
-    lc        = (df["low"]  - pc).abs()
-    df["tr"]  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    df["atr"] = df["tr"].rolling(window=atr_len, min_periods=atr_len).mean()
-
-    # Drop only warmup rows (where MA or ATR not yet ready)
-    df = df.dropna(subset=["ma", "atr"])
-    # VWAP should now always be valid — fill any remaining gaps just in case
-    df["vwap"] = df["vwap"].ffill().bfill()
-
-    if df.empty:
-        raise ValueError(
-            f"Zero rows remain after indicator warmup. "
-            f"Period has {n_bars} bars — SMA={ma_len}, ATR={atr_len} "
-            f"need {min_bars}+ bars. Use a longer period or reduce lengths."
-        )
-    return df
-
-def gen_signals(df, mult):
-    df = df.copy()
-    close = df["close"].squeeze()
-    vwap  = df["vwap"].squeeze()
-    ma    = df["ma"].squeeze()
-    atr   = df["atr"].squeeze()
-    df["buy_sig"]   = (close < vwap) & (close > ma)
-    df["sell_sig"]  = (close > vwap) & (close < ma)
-    df["buy_stop"]  = close - mult * atr
-    df["sell_stop"] = close + mult * atr
-    return df
-
-def safe_float(val):
-    """Safely extract a Python float from any pandas scalar/Series/DataFrame."""
-    if isinstance(val, (pd.Series, pd.DataFrame)):
-        val = val.iloc[0]
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return 0.0
-
-def backtest(df, cap):
-    if df is None or df.empty:
-        raise ValueError("Cannot run backtest: DataFrame is empty.")
-    if len(df) < 2:
-        raise ValueError(f"Cannot run backtest: only {len(df)} row(s). Need at least 2.")
-    # Flatten all columns to plain Series
-    for col in list(df.columns):
-        s = df[col]
-        if isinstance(s, pd.DataFrame):
-            df[col] = s.iloc[:, 0]
-    capital = float(cap)
-    pos = entry_px = stop_px = 0.0
-    entry_time = entry_bar = None
-    trades, equity = [], []
-    bah0 = safe_float(df["close"].iloc[0])
-    if bah0 == 0.0:
-        raise ValueError("First close price is zero or invalid — cannot run backtest.")
-    for i, (_, row) in enumerate(df.iterrows()):
-        bar = i + 1
-        if pos == 1 and safe_float(row["low"]) <= stop_px:
-            pnl = stop_px - entry_px; capital += pnl
-            trades.append(dict(num=len(trades)+1, type="Buy",
-                entry_time=entry_time, exit_time=row.name,
-                entry_bar=entry_bar, exit_bar=bar, bars=bar-entry_bar,
-                entry_px=round(entry_px,2), exit_px=round(stop_px,2),
-                exit_type="Stop Loss", pnl=round(pnl,2),
-                pnl_pct=round(pnl/entry_px*100,3),
-                result="Win" if pnl>0 else "Loss"))
-            pos = 0
-        elif pos == -1 and safe_float(row["high"]) >= stop_px:
-            pnl = entry_px - stop_px; capital += pnl
-            trades.append(dict(num=len(trades)+1, type="Sell",
-                entry_time=entry_time, exit_time=row.name,
-                entry_bar=entry_bar, exit_bar=bar, bars=bar-entry_bar,
-                entry_px=round(entry_px,2), exit_px=round(stop_px,2),
-                exit_type="Stop Loss", pnl=round(pnl,2),
-                pnl_pct=round(pnl/entry_px*100,3),
-                result="Win" if pnl>0 else "Loss"))
-            pos = 0
-        if pos == 0:
-            if row["buy_sig"]:
-                pos=1; entry_px=safe_float(row["close"]); stop_px=safe_float(row["buy_stop"])
-                entry_time=row.name; entry_bar=bar
-            elif row["sell_sig"]:
-                pos=-1; entry_px=safe_float(row["close"]); stop_px=safe_float(row["sell_stop"])
-                entry_time=row.name; entry_bar=bar
-        equity.append(capital)
-    df = df.copy()
-    df["equity"] = equity[:len(df)]
-    df["bah"]    = [cap * safe_float(df["close"].iloc[i]) / bah0 for i in range(len(df))]
-    df["dd"]     = df["equity"] - df["equity"].cummax()
-    df["dd_pct"] = df["dd"] / df["equity"].cummax() * 100
-    return df, pd.DataFrame(trades), capital
-
-def compute_stats(tdf, cap0, capN, df):
-    s = {}; n = len(tdf); s["n"] = n
-    if n == 0: return s
-    pnl  = tdf["pnl"]
-    gp   = pnl[pnl>0].sum(); gl = abs(pnl[pnl<0].sum())
-    wins = int((pnl>0).sum()); loss = int((pnl<0).sum())
-    s["net"]=round(capN-cap0,2); s["net_pct"]=round((capN-cap0)/cap0*100,2)
-    s["gp"]=round(gp,2); s["gl"]=round(gl,2)
-    s["pf"]=round(gp/gl,3) if gl else float("inf")
-    s["wins"]=wins; s["losses"]=loss
-    s["wr"]=round(wins/n*100,2)
-    s["avg_trade"]=round(pnl.mean(),2); s["avg_trade_pct"]=round(pnl.mean()/cap0*100,3)
-    s["avg_win"]=round(pnl[pnl>0].mean(),2) if wins else 0
-    s["avg_loss"]=round(pnl[pnl<0].mean(),2) if loss else 0
-    s["best"]=round(pnl.max(),2); s["worst"]=round(pnl.min(),2)
-    s["avg_bars"]=round(tdf["bars"].mean(),1)
-    s["avg_bars_win"]=round(tdf.loc[tdf["result"]=="Win","bars"].mean(),1) if wins else 0
-    s["avg_bars_loss"]=round(tdf.loc[tdf["result"]=="Loss","bars"].mean(),1) if loss else 0
-    dd = df["dd"]
-    s["max_dd"]=round(abs(dd.min()),2)
-    s["max_dd_pct"]=round(abs(df["dd_pct"].min()),2)
-    res=tdf["result"].tolist(); mw=ml=cw=cl=0
-    for r in res:
-        if r=="Win": cw+=1; cl=0
-        else:        cl+=1; cw=0
-        mw=max(mw,cw); ml=max(ml,cl)
-    s["consec_win"]=mw; s["consec_loss"]=ml
-    tdf2=tdf.copy()
-    tdf2["month"]=pd.to_datetime(tdf2["entry_time"]).dt.to_period("M").astype(str)
-    s["monthly"]=tdf2.groupby("month")["pnl"].sum().reset_index()
-    s["monthly"].columns=["Month","P&L"]
-    buys=tdf[tdf["type"]=="Buy"]; sells=tdf[tdf["type"]=="Sell"]
-    s["buy_n"]=len(buys); s["sell_n"]=len(sells)
-    s["buy_wr"]=round((buys["pnl"]>0).sum()/len(buys)*100,1) if len(buys) else 0
-    s["sell_wr"]=round((sells["pnl"]>0).sum()/len(sells)*100,1) if len(sells) else 0
-    return s
-
-
 # ─────────────────────────────────────────────────────────────
 #  CHART BUILDERS
 # ─────────────────────────────────────────────────────────────
@@ -767,19 +574,24 @@ with st.sidebar:
         st.markdown(f"""
         <div style="background:#131722;border:1px solid #2a2e39;border-radius:8px;
           padding:10px 14px;margin-bottom:8px">
-          <span style="color:#d1d4dc;font-weight:700">{st.session_state.selected_sym}</span>
+          <span style="color:#d1d4dc;font-weight:700">{html.escape(st.session_state.selected_sym)}</span>
         </div>
         """, unsafe_allow_html=True)
 
-    if st.button("🔍 Search Symbol", use_container_width=True):
+    if st.button("🔍 Search Symbol", width="stretch"):
         st.session_state.show_search = not st.session_state.show_search
         st.rerun()
 
     # Manual override
-    manual = st.text_input("Or type ticker directly", value="",
-                           placeholder="e.g. SBIN.NS", key="manual_ticker")
-    if manual.strip():
-        st.session_state.selected_sym = manual.strip().upper()
+    # Only apply the typed ticker when it actually changes. Applying it on every rerun
+    # overrode any symbol picked from Symbol Search while this box still had text in it.
+    def _apply_manual_ticker():
+        typed = st.session_state.get("manual_ticker", "").strip()
+        if typed:
+            st.session_state.selected_sym = typed.upper()
+
+    st.text_input("Or type ticker directly", value="", placeholder="e.g. SBIN.NS",
+                  key="manual_ticker", on_change=_apply_manual_ticker)
 
     ticker = st.session_state.selected_sym
 
@@ -790,17 +602,23 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**📐 Indicators**")
+    session_reset = st.checkbox("Reset VWAP every trading day (intraday)", value=True,
+                                help="Standard VWAP restarts each session. Untick for one "
+                                     "cumulative VWAP over the whole period (daily bars always use that).")
     ma_length  = st.slider("SMA Length",     5,  50, 14)
     atr_length = st.slider("ATR Length",     5,  50, 14)
     atr_mult   = st.slider("ATR Multiplier", 0.5, 4.0, 1.5, 0.1)
 
     st.markdown("---")
     st.markdown("**💰 Capital**")
-    starting_cap = st.number_input("Starting Capital", value=1_000_000, step=10000)
+    starting_cap = st.number_input("Starting Capital", value=1_000_000, min_value=1, step=10000)
+    units = st.number_input("Units per trade", value=1.0, min_value=0.0001, step=1.0,
+                            help="Quantity bought/sold on every signal. Buy & Hold in the charts "
+                                 "holds the same number of units, so the two are comparable.")
     currency     = st.selectbox("Currency", ["INR","USD","EUR","GBP"])
 
     st.markdown("---")
-    run_btn = st.button("🚀 Run Strategy", use_container_width=True, type="primary")
+    run_btn = st.button("🚀 Run Strategy", width="stretch", type="primary")
 
     st.markdown("---")
     st.markdown("""<div style='font-size:11px;color:#787b86;line-height:1.8'>
@@ -880,6 +698,11 @@ if not run_btn and not st.session_state.get("last_run"):
 if run_btn:
     st.session_state["last_run"] = ticker
 ticker = st.session_state.get("last_run", ticker)
+try:
+    ticker = clean_ticker(ticker)
+except ValueError as exc:
+    st.error(f"❌ {exc}")
+    st.stop()
 
 # ─────────────────────────────────────────────────────────────
 #  FETCH + BACKTEST
@@ -924,9 +747,9 @@ with st.spinner(f"📥 Fetching {ticker} ({interval} · {period}) …"):
 
 with st.spinner("⚙️ Running backtest …"):
     try:
-        df   = calc_indicators(raw, ma_length, atr_length)
+        df   = calc_indicators(raw, ma_length, atr_length, session_reset=session_reset)
         df   = gen_signals(df, atr_mult)
-        df, tdf, final_cap = backtest(df, starting_cap)
+        df, tdf, final_cap = backtest(df, starting_cap, units)
         s    = compute_stats(tdf, starting_cap, final_cap, df)
     except (ValueError, IndexError, KeyError) as e:
         st.error(f"❌ Backtest error: {e}")
@@ -1021,6 +844,13 @@ if s.get("n", 0) > 0:
 else:
     st.warning("🔍 No completed trades. Try a longer period or different ticker.")
 
+_open = df.attrs.get("open_position")
+if _open:
+    st.info(f"Open {_open['type'].lower()} position since {str(_open['entry_time'])[:16]} "
+            f"@ {_open['entry_px']:.2f} (stop {_open['stop_px']:.2f}), unrealised "
+            f"{_open['unrealised']:+,.2f} {currency}. Open trades are not in the closed-trade "
+            "statistics, but they are in the equity curve and drawdown.")
+
 
 # ─────────────────────────────────────────────────────────────
 #  TABS
@@ -1030,137 +860,138 @@ t1, t2, t3, t4 = st.tabs(["Overview","Performance Summary","List of Trades","Pro
 # ── TAB 1: OVERVIEW ──
 with t1:
     st.markdown("#### Equity · Drawdown · Buy & Hold")
-    st.plotly_chart(overview_chart(df, starting_cap), use_container_width=True)
+    st.plotly_chart(overview_chart(df, starting_cap), width="stretch")
     lc1,lc2,lc3,_ = st.columns([1,1,1.4,4])
     lc1.markdown("☑️ <span style='color:#26a69a;font-size:12px'>Equity</span>", unsafe_allow_html=True)
     lc2.markdown("☑️ <span style='color:#ef5350;font-size:12px'>Drawdown</span>", unsafe_allow_html=True)
     lc3.markdown("☑️ <span style='color:#2196f3;font-size:12px'>Buy & Hold Equity</span>", unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("#### Price Chart with Signals")
-    st.plotly_chart(price_chart(df, ma_length), use_container_width=True)
+    st.plotly_chart(price_chart(df, ma_length), width="stretch")
 
 
 # ── TAB 2: PERFORMANCE SUMMARY ──
 with t2:
     if not s.get("n"):
-        st.info("No trades to summarize."); st.stop()
+        st.info("No trades to summarize.")
+    else:
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        np_bar = min(abs(s["net_pct"]),100)
-        bc = "#26a69a" if s["net"]>=0 else "#ef5350"
-        st.markdown(f"""<div class="sc"><div class="sc-title">💰 P&L Overview</div>
-        <table class="pt">
-        <tr><td>Net Profit</td><td style="color:{bc};font-weight:700">
-          {s['net']:+,.2f} {currency} <span style="font-size:11px">({s['net_pct']:+.2f}%)</span></td></tr>
-        <tr><td>Gross Profit</td><td style="color:#26a69a;font-weight:600">{s['gp']:,.2f} {currency}</td></tr>
-        <tr><td>Gross Loss</td><td style="color:#ef5350;font-weight:600">−{s['gl']:,.2f} {currency}</td></tr>
-        <tr><td>Profit Factor</td>
-          <td style="color:{'#26a69a' if s['pf']>=1 else '#ef5350'};font-weight:700">{s['pf']:.3f}</td></tr>
-        <tr><td>Buy & Hold Return</td>
-          <td style="color:#2196f3;font-weight:600">
-          {round((df['bah'].iloc[-1]-starting_cap)/starting_cap*100,2):+.2f}%</td></tr>
-        <tr><td>Starting Capital</td><td>{starting_cap:,.0f} {currency}</td></tr>
-        <tr><td>Final Capital</td><td style="font-weight:600">{final_cap:,.2f} {currency}</td></tr>
-        </table>
-        <div class="pb-wrap" style="margin-top:10px">
-          <div class="pb-fill" style="width:{np_bar}%;background:{bc}"></div></div>
-        <div style="font-size:10px;color:#787b86;margin-top:4px">Return vs Starting Capital</div>
-        </div>""", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            np_bar = min(abs(s["net_pct"]),100)
+            bc = "#26a69a" if s["net"]>=0 else "#ef5350"
+            st.markdown(f"""<div class="sc"><div class="sc-title">💰 P&L Overview</div>
+            <table class="pt">
+            <tr><td>Net Profit</td><td style="color:{bc};font-weight:700">
+              {s['net']:+,.2f} {currency} <span style="font-size:11px">({s['net_pct']:+.2f}%)</span></td></tr>
+            <tr><td>Gross Profit</td><td style="color:#26a69a;font-weight:600">{s['gp']:,.2f} {currency}</td></tr>
+            <tr><td>Gross Loss</td><td style="color:#ef5350;font-weight:600">−{s['gl']:,.2f} {currency}</td></tr>
+            <tr><td>Profit Factor</td>
+              <td style="color:{'#26a69a' if s['pf']>=1 else '#ef5350'};font-weight:700">{s['pf']:.3f}</td></tr>
+            <tr><td>Buy & Hold Return</td>
+              <td style="color:#2196f3;font-weight:600">
+              {round((df['bah'].iloc[-1]-starting_cap)/starting_cap*100,2):+.2f}%</td></tr>
+            <tr><td>Starting Capital</td><td>{starting_cap:,.0f} {currency}</td></tr>
+            <tr><td>Final Capital</td><td style="font-weight:600">{final_cap:,.2f} {currency}</td></tr>
+            </table>
+            <div class="pb-wrap" style="margin-top:10px">
+              <div class="pb-fill" style="width:{np_bar}%;background:{bc}"></div></div>
+            <div style="font-size:10px;color:#787b86;margin-top:4px">Return vs Starting Capital</div>
+            </div>""", unsafe_allow_html=True)
 
-    with col2:
-        wb = min(s["wr"],100)
-        st.markdown(f"""<div class="sc"><div class="sc-title">📊 Trade Statistics</div>
-        <table class="pt">
-        <tr><td>Total Closed Trades</td><td style="font-weight:700">{s['n']}</td></tr>
-        <tr><td>Winning Trades</td><td style="color:#26a69a;font-weight:600">✅ {s['wins']}</td></tr>
-        <tr><td>Losing Trades</td><td style="color:#ef5350;font-weight:600">❌ {s['losses']}</td></tr>
-        <tr><td>Percent Profitable</td>
-          <td style="color:{'#26a69a' if s['wr']>=50 else '#ef5350'};font-weight:700">{s['wr']:.2f}%</td></tr>
-        <tr><td>Long (Buy) Trades</td>
-          <td style="color:#26a69a">{s['buy_n']}
-            <span style="color:#787b86;font-size:11px">(WR: {s['buy_wr']}%)</span></td></tr>
-        <tr><td>Short (Sell) Trades</td>
-          <td style="color:#ef5350">{s['sell_n']}
-            <span style="color:#787b86;font-size:11px">(WR: {s['sell_wr']}%)</span></td></tr>
-        <tr><td>Avg Bars in Trade</td><td>{s['avg_bars']}</td></tr>
-        </table>
-        <div class="pb-wrap" style="margin-top:10px">
-          <div class="pb-fill" style="width:{wb}%;background:#26a69a"></div></div>
-        <div style="font-size:10px;color:#787b86;margin-top:4px">Win Rate: {s['wr']:.1f}%</div>
-        </div>""", unsafe_allow_html=True)
+        with col2:
+            wb = min(s["wr"],100)
+            st.markdown(f"""<div class="sc"><div class="sc-title">📊 Trade Statistics</div>
+            <table class="pt">
+            <tr><td>Total Closed Trades</td><td style="font-weight:700">{s['n']}</td></tr>
+            <tr><td>Winning Trades</td><td style="color:#26a69a;font-weight:600">✅ {s['wins']}</td></tr>
+            <tr><td>Losing Trades</td><td style="color:#ef5350;font-weight:600">❌ {s['losses']}</td></tr>
+            <tr><td>Percent Profitable</td>
+              <td style="color:{'#26a69a' if s['wr']>=50 else '#ef5350'};font-weight:700">{s['wr']:.2f}%</td></tr>
+            <tr><td>Long (Buy) Trades</td>
+              <td style="color:#26a69a">{s['buy_n']}
+                <span style="color:#787b86;font-size:11px">(WR: {s['buy_wr']}%)</span></td></tr>
+            <tr><td>Short (Sell) Trades</td>
+              <td style="color:#ef5350">{s['sell_n']}
+                <span style="color:#787b86;font-size:11px">(WR: {s['sell_wr']}%)</span></td></tr>
+            <tr><td>Avg Bars in Trade</td><td>{s['avg_bars']}</td></tr>
+            </table>
+            <div class="pb-wrap" style="margin-top:10px">
+              <div class="pb-fill" style="width:{wb}%;background:#26a69a"></div></div>
+            <div style="font-size:10px;color:#787b86;margin-top:4px">Win Rate: {s['wr']:.1f}%</div>
+            </div>""", unsafe_allow_html=True)
 
-    with col3:
-        ddb = min(s["max_dd_pct"],100)
-        st.markdown(f"""<div class="sc"><div class="sc-title">📉 Drawdown & Risk</div>
-        <table class="pt">
-        <tr><td>Max Drawdown</td>
-          <td style="color:#ef5350;font-weight:700">{s['max_dd']:,.2f} {currency}
-            <span style="font-size:11px">({s['max_dd_pct']:.2f}%)</span></td></tr>
-        <tr><td>Avg Win</td><td style="color:#26a69a;font-weight:600">{s['avg_win']:+,.2f} {currency}</td></tr>
-        <tr><td>Avg Loss</td><td style="color:#ef5350;font-weight:600">{s['avg_loss']:+,.2f} {currency}</td></tr>
-        <tr><td>Best Trade</td><td style="color:#26a69a;font-weight:600">{s['best']:+,.2f} {currency}</td></tr>
-        <tr><td>Worst Trade</td><td style="color:#ef5350;font-weight:600">{s['worst']:+,.2f} {currency}</td></tr>
-        <tr><td>Avg Trade</td>
-          <td style="color:{'#26a69a' if s['avg_trade']>=0 else '#ef5350'}">
-          {s['avg_trade']:+,.2f} <span style="font-size:11px">({s['avg_trade_pct']:+.3f}%)</span></td></tr>
-        <tr><td>Win / Loss Ratio</td>
-          <td>{round(abs(s['avg_win']/s['avg_loss']),2) if s['avg_loss'] else '∞'}</td></tr>
-        </table>
-        <div class="pb-wrap" style="margin-top:10px">
-          <div class="pb-fill" style="width:{ddb}%;background:#ef5350"></div></div>
-        <div style="font-size:10px;color:#787b86;margin-top:4px">Max Drawdown: {s['max_dd_pct']:.1f}%</div>
-        </div>""", unsafe_allow_html=True)
+        with col3:
+            ddb = min(s["max_dd_pct"],100)
+            st.markdown(f"""<div class="sc"><div class="sc-title">📉 Drawdown & Risk</div>
+            <table class="pt">
+            <tr><td>Max Drawdown</td>
+              <td style="color:#ef5350;font-weight:700">{s['max_dd']:,.2f} {currency}
+                <span style="font-size:11px">({s['max_dd_pct']:.2f}%)</span></td></tr>
+            <tr><td>Avg Win</td><td style="color:#26a69a;font-weight:600">{s['avg_win']:+,.2f} {currency}</td></tr>
+            <tr><td>Avg Loss</td><td style="color:#ef5350;font-weight:600">{s['avg_loss']:+,.2f} {currency}</td></tr>
+            <tr><td>Best Trade</td><td style="color:#26a69a;font-weight:600">{s['best']:+,.2f} {currency}</td></tr>
+            <tr><td>Worst Trade</td><td style="color:#ef5350;font-weight:600">{s['worst']:+,.2f} {currency}</td></tr>
+            <tr><td>Avg Trade</td>
+              <td style="color:{'#26a69a' if s['avg_trade']>=0 else '#ef5350'}">
+              {s['avg_trade']:+,.2f} <span style="font-size:11px">({s['avg_trade_pct']:+.3f}%)</span></td></tr>
+            <tr><td>Win / Loss Ratio</td>
+              <td>{round(abs(s['avg_win']/s['avg_loss']),2) if s['avg_loss'] else '∞'}</td></tr>
+            </table>
+            <div class="pb-wrap" style="margin-top:10px">
+              <div class="pb-fill" style="width:{ddb}%;background:#ef5350"></div></div>
+            <div style="font-size:10px;color:#787b86;margin-top:4px">Max Drawdown: {s['max_dd_pct']:.1f}%</div>
+            </div>""", unsafe_allow_html=True)
 
-    col4, col5 = st.columns(2)
-    with col4:
-        cw_b = min(s["consec_win"]*10, 100)
-        cl_b = min(s["consec_loss"]*10,100)
-        st.markdown(f"""<div class="sc"><div class="sc-title">🔁 Consecutive Trades</div>
-        <table class="pt">
-        <tr><td>Max Consecutive Wins</td>
-          <td style="color:#26a69a;font-weight:700">{s['consec_win']}</td></tr>
-        <tr><td>Max Consecutive Losses</td>
-          <td style="color:#ef5350;font-weight:700">{s['consec_loss']}</td></tr>
-        </table>
-        <div style="margin-top:12px">
-          <div style="font-size:11px;color:#787b86;margin-bottom:4px">Consecutive Wins</div>
-          <div class="pb-wrap"><div class="pb-fill" style="width:{cw_b}%;background:#26a69a"></div></div>
-          <div style="font-size:11px;color:#787b86;margin:10px 0 4px">Consecutive Losses</div>
-          <div class="pb-wrap"><div class="pb-fill" style="width:{cl_b}%;background:#ef5350"></div></div>
-        </div></div>""", unsafe_allow_html=True)
+        col4, col5 = st.columns(2)
+        with col4:
+            cw_b = min(s["consec_win"]*10, 100)
+            cl_b = min(s["consec_loss"]*10,100)
+            st.markdown(f"""<div class="sc"><div class="sc-title">🔁 Consecutive Trades</div>
+            <table class="pt">
+            <tr><td>Max Consecutive Wins</td>
+              <td style="color:#26a69a;font-weight:700">{s['consec_win']}</td></tr>
+            <tr><td>Max Consecutive Losses</td>
+              <td style="color:#ef5350;font-weight:700">{s['consec_loss']}</td></tr>
+            </table>
+            <div style="margin-top:12px">
+              <div style="font-size:11px;color:#787b86;margin-bottom:4px">Consecutive Wins</div>
+              <div class="pb-wrap"><div class="pb-fill" style="width:{cw_b}%;background:#26a69a"></div></div>
+              <div style="font-size:11px;color:#787b86;margin:10px 0 4px">Consecutive Losses</div>
+              <div class="pb-wrap"><div class="pb-fill" style="width:{cl_b}%;background:#ef5350"></div></div>
+            </div></div>""", unsafe_allow_html=True)
 
-    with col5:
-        wb2 = s["avg_bars_win"]; lb2 = s["avg_bars_loss"]; mb = max(wb2,lb2,1)
-        st.markdown(f"""<div class="sc"><div class="sc-title">⏱️ Time in Trades</div>
-        <table class="pt">
-        <tr><td>Avg Bars — Winning</td>
-          <td style="color:#26a69a;font-weight:600">{wb2}</td></tr>
-        <tr><td>Avg Bars — Losing</td>
-          <td style="color:#ef5350;font-weight:600">{lb2}</td></tr>
-        <tr><td>Overall Avg Bars</td>
-          <td style="font-weight:600">{s['avg_bars']}</td></tr>
-        </table>
-        <div style="margin-top:12px">
-          <div style="font-size:11px;color:#787b86;margin-bottom:4px">Win Bars</div>
-          <div class="pb-wrap"><div class="pb-fill" style="width:{min(wb2/mb*100,100):.0f}%;background:#26a69a"></div></div>
-          <div style="font-size:11px;color:#787b86;margin:10px 0 4px">Loss Bars</div>
-          <div class="pb-wrap"><div class="pb-fill" style="width:{min(lb2/mb*100,100):.0f}%;background:#ef5350"></div></div>
-        </div></div>""", unsafe_allow_html=True)
+        with col5:
+            wb2 = s["avg_bars_win"]; lb2 = s["avg_bars_loss"]; mb = max(wb2,lb2,1)
+            st.markdown(f"""<div class="sc"><div class="sc-title">⏱️ Time in Trades</div>
+            <table class="pt">
+            <tr><td>Avg Bars — Winning</td>
+              <td style="color:#26a69a;font-weight:600">{wb2}</td></tr>
+            <tr><td>Avg Bars — Losing</td>
+              <td style="color:#ef5350;font-weight:600">{lb2}</td></tr>
+            <tr><td>Overall Avg Bars</td>
+              <td style="font-weight:600">{s['avg_bars']}</td></tr>
+            </table>
+            <div style="margin-top:12px">
+              <div style="font-size:11px;color:#787b86;margin-bottom:4px">Win Bars</div>
+              <div class="pb-wrap"><div class="pb-fill" style="width:{min(wb2/mb*100,100):.0f}%;background:#26a69a"></div></div>
+              <div style="font-size:11px;color:#787b86;margin:10px 0 4px">Loss Bars</div>
+              <div class="pb-wrap"><div class="pb-fill" style="width:{min(lb2/mb*100,100):.0f}%;background:#ef5350"></div></div>
+            </div></div>""", unsafe_allow_html=True)
 
-    st.markdown("---")
-    ch1, ch2 = st.columns(2)
-    with ch1:
-        st.markdown('<div class="sc"><div class="sc-title">📅 Monthly P&L</div></div>', unsafe_allow_html=True)
-        if len(s["monthly"])>0: st.plotly_chart(monthly_chart(s["monthly"]), use_container_width=True)
-    with ch2:
-        st.markdown('<div class="sc"><div class="sc-title">📊 P&L Distribution</div></div>', unsafe_allow_html=True)
-        st.plotly_chart(dist_chart(tdf), use_container_width=True)
+        st.markdown("---")
+        ch1, ch2 = st.columns(2)
+        with ch1:
+            st.markdown('<div class="sc"><div class="sc-title">📅 Monthly P&L</div></div>', unsafe_allow_html=True)
+            if len(s["monthly"])>0: st.plotly_chart(monthly_chart(s["monthly"]), width="stretch")
+        with ch2:
+            st.markdown('<div class="sc"><div class="sc-title">📊 P&L Distribution</div></div>', unsafe_allow_html=True)
+            st.plotly_chart(dist_chart(tdf), width="stretch")
 
-    st.markdown('<div class="sc"><div class="sc-title">📉 Drawdown Over Time</div></div>', unsafe_allow_html=True)
-    st.plotly_chart(dd_chart(df), use_container_width=True)
-    st.markdown('<div class="sc"><div class="sc-title">📈 Strategy Equity vs Buy & Hold</div></div>', unsafe_allow_html=True)
-    st.plotly_chart(eq_bah_chart(df, starting_cap), use_container_width=True)
+        st.markdown('<div class="sc"><div class="sc-title">📉 Drawdown Over Time</div></div>', unsafe_allow_html=True)
+        st.plotly_chart(dd_chart(df), width="stretch")
+        st.markdown('<div class="sc"><div class="sc-title">📈 Strategy Equity vs Buy & Hold</div></div>', unsafe_allow_html=True)
+        st.plotly_chart(eq_bah_chart(df, starting_cap), width="stretch")
 
 
 # ── TAB 3: LIST OF TRADES ──
@@ -1208,7 +1039,7 @@ with t3:
             sg = "+" if r["pnl"]>=0 else ""
             rpc= "#26a69a" if running>=0 else "#ef5350"
             tl = f"<span style='color:{tc};font-weight:600'>{'▲ Long' if ib else '▼ Short'}</span>"
-            rb = f"<span class='badge' style='background:{'#1a3a1f' if r['pnl']>=0 else '#3a1a1a'};color:{rc};border:1px solid {rc}'>{'Win' if r['pnl']>=0 else 'Loss'}</span>"
+            rb = f"<span class='badge' style='background:{'#1a3a1f' if r['result']=='Win' else '#3a1a1a'};color:{rc};border:1px solid {rc}'>{r['result']}</span>"
             rows += f"""<tr>
               <td style="color:#787b86">{int(r['num'])}</td><td>{tl}</td>
               <td style="color:#787b86">{str(r['entry_time'])[:16]}</td>
@@ -1269,7 +1100,7 @@ with t4:
     with pc2:
         st.markdown(f"""<div class="sc"><div class="sc-title">📐 Indicator Parameters</div>
         <table class="pt">
-        <tr><td>VWAP Source</td><td style="color:#2196f3;font-weight:600">HLC3</td></tr>
+        <tr><td>VWAP Source</td><td style="color:#2196f3;font-weight:600">HLC3{' · daily reset' if (session_reset and is_intraday(df.index)) else ''}</td></tr>
         <tr><td>MA Type</td><td style="color:#ff9800;font-weight:600">SMA</td></tr>
         <tr><td>MA Length</td><td style="color:#ff9800;font-weight:700">{ma_length} bars</td></tr>
         <tr><td>ATR Length</td><td style="color:#9c27b0;font-weight:700">{atr_length} bars</td></tr>
@@ -1291,7 +1122,7 @@ with t4:
           {s.get('net_pct',0):+.2f}%</td></tr>
         <tr><td>Stop Loss</td><td style="color:#ef5350;font-weight:600">ATR-Based Dynamic</td></tr>
         <tr><td>Take Profit</td><td style="color:#787b86">Not defined</td></tr>
-        <tr><td>Position Size</td><td style="color:#787b86">1 unit/signal</td></tr>
+        <tr><td>Position Size</td><td style="color:#787b86">{units:g} unit(s)/signal</td></tr>
         <tr><td>Trade Direction</td><td style="color:#d1d4dc">Long & Short</td></tr>
         <tr><td>Max Open Pos.</td><td style="color:#d1d4dc">1 at a time</td></tr>
         <tr><td>Commission</td><td style="color:#787b86">Not modelled</td></tr>
